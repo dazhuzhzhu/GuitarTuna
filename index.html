@@ -497,61 +497,43 @@
             freqBar.style.width = barPercent + '%';
         }
 
-        // 自相关函数检测音高（更准确）
+        // 自相关函数检测音高（Chris Wilson 版，手机端更灵敏）
         function autoCorrelate(buffer, sampleRate) {
             const SIZE = buffer.length;
+            const MAX_SAMPLES = Math.floor(SIZE / 2);
             let rms = 0;
-            
-            // 计算 RMS
-            for (let i = 0; i < SIZE; i++) {
-                rms += buffer[i] * buffer[i];
-            }
+            for (let i = 0; i < SIZE; i++) rms += buffer[i] * buffer[i];
             rms = Math.sqrt(rms / SIZE);
-            
-            // 声音太小
-            if (rms < 0.01) return -1;
-            
-            // 自相关
-            let r1 = 0, r2 = SIZE - 1;
-            const threshold = 0.2;
-            
-            for (let i = 0; i < SIZE / 2; i++) {
-                if (Math.abs(buffer[i]) < threshold) { r1 = i; break; }
-            }
-            for (let i = 1; i < SIZE / 2; i++) {
-                if (Math.abs(buffer[SIZE - i]) < threshold) { r2 = SIZE - i; break; }
-            }
-            
-            const buf2 = buffer.slice(r1, r2);
-            const c = new Array(buf2.length).fill(0);
-            
-            for (let i = 0; i < buf2.length; i++) {
-                for (let j = 0; j < buf2.length - i; j++) {
-                    c[i] += buf2[j] * buf2[j + i];
+
+            // 门限放得很低，配合 GainNode 15x 增益足够
+            if (rms < 0.003) return -1;
+
+            const correlations = new Array(MAX_SAMPLES);
+            let best_offset = -1, best_correlation = 0;
+            let lastCorrelation = 1, foundGoodCorrelation = false;
+
+            for (let offset = 0; offset < MAX_SAMPLES; offset++) {
+                let correlation = 0;
+                for (let i = 0; i < MAX_SAMPLES; i++) {
+                    correlation += Math.abs(buffer[i] - buffer[i + offset]);
                 }
-            }
-            
-            // 找到第一个谷底
-            let d = 0;
-            while (c[d] > c[d + 1]) d++;
-            
-            let maxval = -1, maxpos = -1;
-            for (let i = d; i < buf2.length; i++) {
-                if (c[i] > maxval) {
-                    maxval = c[i];
-                    maxpos = i;
+                correlation = 1 - correlation / MAX_SAMPLES;
+                correlations[offset] = correlation;
+
+                if (correlation > 0.85 && correlation > lastCorrelation) {
+                    foundGoodCorrelation = true;
+                    if (correlation > best_correlation) {
+                        best_correlation = correlation;
+                        best_offset = offset;
+                    }
+                } else if (foundGoodCorrelation && best_offset > 0) {
+                    const shift = (correlations[best_offset + 1] - correlations[best_offset - 1]) / correlations[best_offset];
+                    return sampleRate / (best_offset + 8 * shift);
                 }
+                lastCorrelation = correlation;
             }
-            
-            let T0 = maxpos;
-            
-            // 二次插值
-            const x1 = c[T0 - 1], x2 = c[T0], x3 = c[T0 + 1];
-            const a = (x1 + x3 - 2 * x2) / 2;
-            const b = (x3 - x1) / 2;
-            if (a) T0 = T0 - b / (2 * a);
-            
-            return sampleRate / T0;
+            if (best_correlation > 0.01 && best_offset > 0) return sampleRate / best_offset;
+            return -1;
         }
 
         // 处理音频
@@ -578,12 +560,24 @@
         async function startAudio() {
             try {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                await audioContext.resume(); // 适配 iOS Safari
                 analyser = audioContext.createAnalyser();
                 analyser.fftSize = 2048;
-                
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+                // 关闭 iOS 的降噪/自动增益/回声消除，否则吉他持续音会被当噪声压掉
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: false,
+                        noiseSuppression: false,
+                        autoGainControl: false
+                    }
+                });
                 microphone = audioContext.createMediaStreamSource(stream);
-                microphone.connect(analyser);
+                // 插入 GainNode 放大 15 倍，对抗 iOS 内置弱增益
+                const gainNode = audioContext.createGain();
+                gainNode.gain.value = 15;
+                microphone.connect(gainNode);
+                gainNode.connect(analyser);
                 
                 isRunning = true;
                 startBtn.textContent = '⏹ 停止调音';
