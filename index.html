@@ -212,21 +212,42 @@ async function requestWakeLock() {
   }
 }
 
-// ── 核心音高检测 (Autocorrelation) ──
-function autoCorrelate(buf, sr) {
-  let rms = 0; for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
-  if (Math.sqrt(rms / buf.length) < 0.01) return -1;
-  let r1 = 0, r2 = buf.length - 1;
-  for (let i = 0; i < buf.length / 2; i++) if (Math.abs(buf[i]) < 0.2) { r1 = i; break; }
-  for (let i = 1; i < buf.length / 2; i++) if (Math.abs(buf[buf.length - i]) < 0.2) { r2 = buf.length - i; break; }
-  const s = buf.slice(r1, r2), len = s.length, c = new Array(len).fill(0);
-  for (let i = 0; i < len; i++) for (let j = 0; j < len - i; j++) c[i] += s[j] * s[j + i];
-  let d = 0; while (c[d] > c[d + 1]) d++;
-  let mv = -1, mp = -1;
-  for (let i = d; i < len; i++) if (c[i] > mv) { mv = c[i]; mp = i; }
-  if (mp < 1) return -1;
-  const a = (c[mp-1] + c[mp+1] - 2*c[mp]) / 2, b = (c[mp+1] - c[mp-1]) / 2;
-  return sr / (a ? mp - b / (2 * a) : mp);
+// ── 核心音高检测 (Autocorrelation, Chris Wilson 版，经大量验证) ──
+function autoCorrelate(buf, sampleRate) {
+  const SIZE = buf.length;
+  const MAX_SAMPLES = Math.floor(SIZE / 2);
+  let rms = 0;
+  for (let i = 0; i < SIZE; i++) { const v = buf[i]; rms += v * v; }
+  rms = Math.sqrt(rms / SIZE);
+  if (rms < 0.01) return -1; // 信号太弱
+
+  const correlations = new Array(MAX_SAMPLES);
+  let best_offset = -1, best_correlation = 0;
+  let lastCorrelation = 1, foundGoodCorrelation = false;
+
+  for (let offset = 0; offset < MAX_SAMPLES; offset++) {
+    let correlation = 0;
+    for (let i = 0; i < MAX_SAMPLES; i++) {
+      correlation += Math.abs(buf[i] - buf[i + offset]);
+    }
+    correlation = 1 - correlation / MAX_SAMPLES;
+    correlations[offset] = correlation;
+
+    if (correlation > 0.9 && correlation > lastCorrelation) {
+      foundGoodCorrelation = true;
+      if (correlation > best_correlation) {
+        best_correlation = correlation;
+        best_offset = offset;
+      }
+    } else if (foundGoodCorrelation) {
+      // 抛物线插值提升精度
+      const shift = (correlations[best_offset + 1] - correlations[best_offset - 1]) / correlations[best_offset];
+      return sampleRate / (best_offset + 8 * shift);
+    }
+    lastCorrelation = correlation;
+  }
+  if (best_correlation > 0.01) return sampleRate / best_offset;
+  return -1;
 }
 
 // ── 检测循环 ──
@@ -292,7 +313,7 @@ async function toggleTuner() {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     await audioCtx.resume(); // 适配 iOS Safari
-    analyser = audioCtx.createAnalyser(); analyser.fftSize = 4096;
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 2048;
     audioCtx.createMediaStreamSource(stream).connect(analyser);
     requestWakeLock(); // 保持屏幕常亮
     running = true;
