@@ -395,6 +395,9 @@
         let isRunning = false;
         let selectedString = null;
         let animationId;
+        let smoothedFreq = 0;   // EMA 平滑后的频率
+        let stableFrames = 0;   // 连续稳定帧计数
+        let lastRawFreq = 0;
 
         // 生成刻度
         function createScale() {
@@ -505,8 +508,8 @@
             for (let i = 0; i < SIZE; i++) rms += buffer[i] * buffer[i];
             rms = Math.sqrt(rms / SIZE);
 
-            // 门限放得很低，配合 GainNode 15x 增益足够
-            if (rms < 0.003) return -1;
+            // 门限适中，避免吵闹环境下乱跳
+            if (rms < 0.008) return -1;
 
             const correlations = new Array(MAX_SAMPLES);
             let best_offset = -1, best_correlation = 0;
@@ -520,7 +523,7 @@
                 correlation = 1 - correlation / MAX_SAMPLES;
                 correlations[offset] = correlation;
 
-                if (correlation > 0.85 && correlation > lastCorrelation) {
+                if (correlation > 0.92 && correlation > lastCorrelation) {
                     foundGoodCorrelation = true;
                     if (correlation > best_correlation) {
                         best_correlation = correlation;
@@ -539,20 +542,37 @@
         // 处理音频
         function processAudio() {
             if (!isRunning) return;
-            
+
             const buffer = new Float32Array(analyser.fftSize);
             analyser.getFloatTimeDomainData(buffer);
-            
-            const freq = autoCorrelate(buffer, audioContext.sampleRate);
-            
-            if (freq > 0 && freq < 1000) {
-                const note = freqToNote(freq);
-                updateDisplay(freq, note);
+
+            const rawFreq = autoCorrelate(buffer, audioContext.sampleRate);
+
+            if (rawFreq > 60 && rawFreq < 1000) {
+                // 跳变过滤：新值与上一次相差大于半音则视为噪声，需连续 2 帧一致才采纳
+                const semitoneRatio = lastRawFreq > 0 ? Math.abs(12 * Math.log2(rawFreq / lastRawFreq)) : 0;
+                if (lastRawFreq === 0 || semitoneRatio < 0.5) {
+                    stableFrames++;
+                } else {
+                    stableFrames = 0;
+                }
+                lastRawFreq = rawFreq;
+
+                if (stableFrames >= 2) {
+                    // EMA 平滑：系数 0.25，抗抖动
+                    smoothedFreq = smoothedFreq === 0 ? rawFreq : smoothedFreq * 0.75 + rawFreq * 0.25;
+                    const note = freqToNote(smoothedFreq);
+                    updateDisplay(smoothedFreq, note);
+                }
             } else {
+                // 信号不稳定时逐渐衰减，避免显示"空中楼阁"
+                stableFrames = 0;
+                lastRawFreq = 0;
+                smoothedFreq = 0;
                 status.textContent = '🎤 正在监听...';
                 status.className = 'status listening';
             }
-            
+
             animationId = requestAnimationFrame(processAudio);
         }
 
@@ -573,9 +593,9 @@
                     }
                 });
                 microphone = audioContext.createMediaStreamSource(stream);
-                // 插入 GainNode 放大 15 倍，对抗 iOS 内置弱增益
+                // 插入 GainNode 适度放大，兼顾灵敏与稳定
                 const gainNode = audioContext.createGain();
-                gainNode.gain.value = 15;
+                gainNode.gain.value = 8;
                 microphone.connect(gainNode);
                 gainNode.connect(analyser);
                 
