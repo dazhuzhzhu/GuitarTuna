@@ -308,6 +308,12 @@ let lastVibrateTime = 0;
 let lastAutoIdx = -1, lastAutoSwitchTime = 0;
 const AUTO_SWITCH_DEBOUNCE_MS = 300;
 const AUTO_SWITCH_MAX_CENTS = 30;
+// 频率稳定化
+const FREQ_HISTORY_SIZE = 7;        // 中位数窗口
+const freqHistory = [];
+let displayedFreq = 0;              // 文字显示用（节流）
+let lastDisplayUpdate = 0;
+const DISPLAY_THROTTLE_MS = 180;    // Hz 文字最多每 180ms 刷新
 
 // 根据 A4 缩放频率
 function scaleFreq(f) { return f * (a4 / 440); }
@@ -420,6 +426,8 @@ function detect() {
   if (rms < 0.005) {
     // 静默
     smoothedFreq = 0;
+    freqHistory.length = 0;
+    displayedFreq = 0;
     needleIdle();
     noteEl.className = 'note';
     noteEl.textContent = currentPreset.strings[selectedIdx].note;
@@ -433,8 +441,17 @@ function detect() {
   const rawFreq = yinPitchDetect(buf, audioCtx.sampleRate);
 
   if (rawFreq > 0) {
-    // EMA 平滑
-    smoothedFreq = smoothedFreq === 0 ? rawFreq : smoothedFreq * 0.7 + rawFreq * 0.3;
+    // ① 中位数滤波：7 帧窗口去离群点
+    freqHistory.push(rawFreq);
+    if (freqHistory.length > FREQ_HISTORY_SIZE) freqHistory.shift();
+    const sorted = [...freqHistory].sort((a, b) => a - b);
+    const medianFreq = sorted[sorted.length >> 1];
+
+    // ② 强 EMA 平滑（0.15 新值权重，指针感受更柔和）
+    // 如果频率跳变大（>50 音分），快速跟上；否则慢慢靠近
+    const jumpCents = smoothedFreq > 0 ? Math.abs(centsDiff(medianFreq, smoothedFreq)) : 0;
+    const alpha = jumpCents > 50 ? 0.5 : 0.15;
+    smoothedFreq = smoothedFreq === 0 ? medianFreq : smoothedFreq * (1 - alpha) + medianFreq * alpha;
 
     // 自动选弦（30 音分内 + 300ms 防抖）
     if (autoDetect) {
@@ -464,20 +481,24 @@ function detect() {
 
     const target = scaleFreq(currentPreset.strings[selectedIdx].freq);
     const cents = centsDiff(smoothedFreq, target);
-    setNeedle(cents);
+    setNeedle(cents);  // 指针每帧平滑更新
 
-    noteEl.textContent = currentPreset.strings[selectedIdx].note;
-    freqEl.textContent = `${smoothedFreq.toFixed(2)} Hz · 目标 ${target.toFixed(2)}`;
+    // ③ 文字节流：Hz 数字每 180ms 才更新一次，视觉稳定
+    const now = performance.now();
+    if (now - lastDisplayUpdate > DISPLAY_THROTTLE_MS) {
+      displayedFreq = smoothedFreq;
+      lastDisplayUpdate = now;
+      noteEl.textContent = currentPreset.strings[selectedIdx].note;
+      freqEl.textContent = `${displayedFreq.toFixed(2)} Hz · 目标 ${target.toFixed(2)}`;
+      const roundedC = Math.round(cents);
+      centsEl.textContent = (cents > 0 ? '+' : '') + roundedC + '¢';
+    }
 
     const absC = Math.abs(cents);
-    const roundedC = Math.round(cents);
-    centsEl.textContent = (cents > 0 ? '+' : '') + roundedC + '¢';
-
     if (absC < 5) {
       noteEl.className = 'note in-tune';
       centsEl.className = 'cents in-tune';
       // 振动反馈（移植自 HzSeek ±5 音分准区振动）
-      const now = performance.now();
       if (navigator.vibrate && now - lastVibrateTime > 800) {
         navigator.vibrate(30); lastVibrateTime = now;
       }
@@ -490,7 +511,10 @@ function detect() {
     }
   } else {
     // 有声音但 YIN 没找到音高 → 保持上次显示，指针稳住
-    freqEl.textContent = '🔍 识别中…';
+    if (performance.now() - lastDisplayUpdate > DISPLAY_THROTTLE_MS) {
+      freqEl.textContent = '🔍 识别中…';
+      lastDisplayUpdate = performance.now();
+    }
   }
 
   raf = requestAnimationFrame(detect);
