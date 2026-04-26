@@ -219,7 +219,7 @@ function autoCorrelate(buf, sampleRate) {
   let rms = 0;
   for (let i = 0; i < SIZE; i++) { const v = buf[i]; rms += v * v; }
   rms = Math.sqrt(rms / SIZE);
-  if (rms < 0.01) return -1; // 信号太弱
+  if (rms < 0.005) return { freq: -1, rms }; // 信号太弱
 
   const correlations = new Array(MAX_SAMPLES);
   let best_offset = -1, best_correlation = 0;
@@ -233,21 +233,21 @@ function autoCorrelate(buf, sampleRate) {
     correlation = 1 - correlation / MAX_SAMPLES;
     correlations[offset] = correlation;
 
-    if (correlation > 0.9 && correlation > lastCorrelation) {
+    if (correlation > 0.85 && correlation > lastCorrelation) {
       foundGoodCorrelation = true;
       if (correlation > best_correlation) {
         best_correlation = correlation;
         best_offset = offset;
       }
-    } else if (foundGoodCorrelation) {
+    } else if (foundGoodCorrelation && best_offset > 0) {
       // 抛物线插值提升精度
       const shift = (correlations[best_offset + 1] - correlations[best_offset - 1]) / correlations[best_offset];
-      return sampleRate / (best_offset + 8 * shift);
+      return { freq: sampleRate / (best_offset + 8 * shift), rms };
     }
     lastCorrelation = correlation;
   }
-  if (best_correlation > 0.01) return sampleRate / best_offset;
-  return -1;
+  if (best_correlation > 0.01 && best_offset > 0) return { freq: sampleRate / best_offset, rms };
+  return { freq: -1, rms };
 }
 
 // ── 检测循环 ──
@@ -255,12 +255,13 @@ function detect() {
   if (!running) return;
   const buf = new Float32Array(analyser.fftSize);
   analyser.getFloatTimeDomainData(buf);
-  let rawFreq = autoCorrelate(buf, audioCtx.sampleRate);
+  const { freq: rawFreq, rms } = autoCorrelate(buf, audioCtx.sampleRate);
+  const signalPct = Math.min(100, Math.round(rms * 1000));
 
-  if (rawFreq > 50 && rawFreq < 900) {
+  if (rawFreq > 60 && rawFreq < 1000) {
     // 引入 EMA（指数移动平均）算法防止数值频繁跳动
-    smoothedFreq = smoothedFreq === 0 ? rawFreq : (smoothedFreq * 0.8 + rawFreq * 0.2);
-    
+    smoothedFreq = smoothedFreq === 0 ? rawFreq : (smoothedFreq * 0.7 + rawFreq * 0.3);
+
     let bestDist = Infinity, strIdx = selectedIdx;
     if (mode === 'auto') {
       currentStrings.forEach((s, i) => {
@@ -290,9 +291,16 @@ function detect() {
       pill.textContent = '▼ 偏低 · 请紧弦'; pill.className = 'status-pill show flat';
     }
   } else {
-    // 没声音时逐渐回正
+    // 没检测到稳定音高：显示信号电平，帮助用户排查麦克风是否有输入
     smoothedFreq = 0;
-    targetAngle *= 0.95;
+    targetAngle *= 0.9;
+    const freqEl = document.getElementById('freqVal');
+    if (rms < 0.005) {
+      freqEl.innerHTML = `🎤 请拨动琴弦 <span style="color:#333">·</span> 信号 ${signalPct}%`;
+    } else {
+      freqEl.innerHTML = `🔍 识别中… <span style="color:#333">·</span> 信号 ${signalPct}%`;
+    }
+    document.getElementById('pill').className = 'status-pill';
   }
   raf = requestAnimationFrame(detect);
 }
