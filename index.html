@@ -322,7 +322,10 @@ async function toggleTuner() {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     await audioCtx.resume(); // 适配 iOS Safari
     analyser = audioCtx.createAnalyser(); analyser.fftSize = 2048;
-    audioCtx.createMediaStreamSource(stream).connect(analyser);
+    // 在 source 与 analyser 之间加 GainNode 放大信号，对抗 iOS 内置降噪
+    const src = audioCtx.createMediaStreamSource(stream);
+    const gain = audioCtx.createGain(); gain.gain.value = 15;
+    src.connect(gain); gain.connect(analyser);
     requestWakeLock(); // 保持屏幕常亮
     running = true;
     document.getElementById('toggleBtn').classList.add('on');
